@@ -187,14 +187,14 @@ function build(){
 
   const mats=[], cols=[];
   const NORMAL_Z=new THREE.Vector3(0,0,1);
-  const FRAME_PROUD = T*0.6;   // frame course sits proud so it caps the field edge with no gap
+  const FRAME_PROUD = T*0.18;  // frame course only barely proud — enough to cap the seam, not extrude
 
   // place a brick: (cu,cv) wall-local centre, (sx,sy) in-plane size, phi = length-axis angle,
   // proud = extra outward relief, jf = jitter scale
   function place(wall, baseQuat, cu, cv, sx, sy, phi, proud, jf){
     const ju=(rnd()-0.5)*g*1.2*params.randomness*jf;
     const jv=(rnd()-0.5)*g*1.2*params.randomness*jf;
-    const jn=(rnd()-0.5)*T*0.7*params.randomness*jf;
+    const jn=(rnd()-0.5)*T*0.45*params.randomness*jf;
     const pos=new THREE.Vector3().copy(wall.origin)
       .addScaledVector(wall.uDir, cu+ju)
       .addScaledVector(wall.vDir, cv+jv)
@@ -214,14 +214,13 @@ function build(){
       const oA=(op.type==='circle')?[op.uc-op.rc,op.uc+op.rc,op.vc-op.rc,op.vc+op.rc]
                                    :[op.uc-op.ww/2,op.uc+op.ww/2,op.v0,op.v0+op.wh+op.ww/2];
       if(a1<oA[0]||a0>oA[1]||b1<oA[2]||b0>oA[3]) continue;        // far away -> ignore
-      const NX=8,NY=5; let mnU=1e9,mxU=-1e9,mnV=1e9,mxV=-1e9,any=false;
+      const NX=14,NY=9; let mnU=1e9,mxU=-1e9,mnV=1e9,mxV=-1e9,any=false;
       for(let i=0;i<NX;i++)for(let j=0;j<NY;j++){
         const uu=a0+(i+0.5)/NX*(a1-a0), vv=b0+(j+0.5)/NY*(b1-b0);
         if(!inOpening(op,uu,vv)){ any=true; if(uu<mnU)mnU=uu; if(uu>mxU)mxU=uu; if(vv<mnV)mnV=vv; if(vv>mxV)mxV=vv; }
       }
       if(!any) return null;                                       // brick fully inside the hole
-      const hx=(a1-a0)/NX/2, hy=(b1-b0)/NY/2;                     // reach to the true edge
-      a0=Math.max(a0,mnU-hx); a1=Math.min(a1,mxU+hx); b0=Math.max(b0,mnV-hy); b1=Math.min(b1,mxV+hy);
+      a0=mnU; a1=mxU; b0=mnV; b1=mxV;                            // trim STRICTLY outside the hole (no overhang into the opening)
       if(a1-a0<0.012||b1-b0<0.008) return null;
     }
     return {cu:(a0+a1)/2, cv:(b0+b1)/2, sx:a1-a0, sy:b1-b0};
@@ -249,7 +248,9 @@ function build(){
     // EDGE course on top: bricks following each opening outline, sitting proud so the join is seamless
     for(const op of wall.openings){
       for(const b of borderFor(op, L, Hb, g)){
-        if(b.cu<-0.05 || b.cu>wall.uLen+0.05 || b.cv<-0.05 || b.cv>wall.vLen+0.05) continue;
+        if(b.cu<0 || b.cu>wall.uLen || b.cv<0 || b.cv>wall.vLen) continue;          // trim frame bricks off the wall
+        let inOther=false; for(const o2 of wall.openings){ if(o2!==op && inOpening(o2,b.cu,b.cv)){ inOther=true; break; } }
+        if(inOther) continue;                                                        // ...or into another opening
         place(wall, baseQuat, b.cu, b.cv, L, Hb, b.phi, FRAME_PROUD, 0.3);
       }
     }
