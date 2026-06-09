@@ -294,10 +294,40 @@ function build(){
     }
   }
 
+  // brick ONE normal-island of an imported mesh, in its own plane, relief along its face normal
+  function brickIsland(isl){
+    const N=isl.normal.clone();
+    let v=new THREE.Vector3(0,1,0).addScaledVector(N,-N.y);    // world-up projected into the face plane
+    if(v.lengthSq()<1e-4) v.set(1,0,0).addScaledVector(N,-N.x);
+    v.normalize();
+    const u=v.clone().cross(N).normalize();                    // u x v = N  (length axis lies in the face)
+    const P=isl.centroid, pos=importedMesh.geometry.attributes.position, tmp=new THREE.Vector3();
+    const tris2=[]; let minA=1e9,maxA=-1e9,minB=1e9,maxB=-1e9;
+    for(const t of isl.tris){ const tri=[]; for(let k=0;k<3;k++){ tmp.fromBufferAttribute(pos,t*3+k).sub(P); const a=tmp.dot(u),b=tmp.dot(v); tri.push([a,b]); if(a<minA)minA=a;if(a>maxA)maxA=a;if(b<minB)minB=b;if(b>maxB)maxB=b; } tris2.push(tri); }
+    const stepU=L+g, stepV=Hb+g; let row=0;
+    for(let bb=minB; bb<maxB; bb+=stepV, row++){
+      const off=(row%2)*(stepU/2);
+      for(let aa=minA-off; aa<maxA+stepU; aa+=stepU){
+        const ca=aa+L/2, cb=bb+Hb/2;
+        let inside=false; for(const tt of tris2){ if(pointInTri2D(ca,cb,tt)){ inside=true; break; } }
+        if(!inside) continue;
+        const jn=(rnd()-0.5)*T*0.4*params.randomness;
+        const p3=P.clone().addScaledVector(u,ca).addScaledVector(v,cb).addScaledVector(N, T*0.5 + jn);
+        const q=new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(u,v,N));
+        if(rotMax>0) q.multiply(new THREE.Quaternion().setFromEuler(new THREE.Euler((rnd()-0.5)*rotMax,(rnd()-0.5)*rotMax,(rnd()-0.5)*rotMax)));
+        const sj=1+(rnd()-0.5)*0.12*params.randomness;
+        mats.push(new THREE.Matrix4().compose(p3,q,new THREE.Vector3(L*sj,Hb*sj,T)));
+        const c=base.clone(); c.multiplyScalar(1+(rnd()-0.5)*0.35*Math.max(0.25,params.randomness)); cols.push(c);
+      }
+    }
+  }
+
+  if(importedMesh){
+    for(const isl of importedIslands) if(selectedIslands.has(isl.id)) brickIsland(isl);
+  } else
   for(const wall of walls){
     const basis=new THREE.Matrix4().makeBasis(wall.uDir, wall.vDir, wall.normal);
     const baseQuat=new THREE.Quaternion().setFromRotationMatrix(basis);
-    if(importedMesh){ cladByRaycast(wall, baseQuat); continue; }
 
     // FIELD: running bond across the whole wall, every brick clipped to fit the wall + openings (no gaps)
     const rows=Math.floor(wall.vLen/stepV)+1;
@@ -327,7 +357,8 @@ function build(){
 
   const count = mats.length;
   lastMatrices = mats;
-  if(csgReady){
+  if(count===0){ brickMesh=null; lastBrickGeo=null; }
+  else if(csgReady){
     // merge all bricks (with per-brick vertex colour), then boolean-subtract each opening -> clean curved edges
     const geoms=[];
     for(let i=0;i<count;i++){ const gg=unitBox.clone(); gg.deleteAttribute('uv'); gg.applyMatrix4(mats[i]); geoms.push(gg); }
@@ -429,6 +460,83 @@ fileInput.addEventListener('change', e=>{
   reader.readAsArrayBuffer(f);
   fileInput.value='';
 });
+// ---- normal-island detection + click selection for imported meshes ----
+let importedIslands=[];           // [{id, tris:[triIdx], normal, centroid, size}]
+let islandOfTri=null;             // Int32Array: tri -> island id
+const selectedIslands=new Set();  // island ids that get bricks
+let pickingSetup=false, _downXY=null;
+const _ray=new THREE.Raycaster(), _ndc=new THREE.Vector2();
+function pointInTri2D(px,py,t){
+  const a=t[0],b=t[1],c=t[2];
+  const d=(b[1]-c[1])*(a[0]-c[0])+(c[0]-b[0])*(a[1]-c[1]);
+  if(Math.abs(d)<1e-12) return false;
+  const wa=((b[1]-c[1])*(px-c[0])+(c[0]-b[0])*(py-c[1]))/d;
+  const wb=((c[1]-a[1])*(px-c[0])+(a[0]-c[0])*(py-c[1]))/d;
+  return wa>=-0.001 && wb>=-0.001 && (1-wa-wb)>=-0.001;
+}
+function computeIslands(geo){
+  const pos=geo.attributes.position, triCount=(pos.count/3)|0;
+  const triN=new Array(triCount);
+  const va=new THREE.Vector3(),vb=new THREE.Vector3(),vc=new THREE.Vector3(),e1=new THREE.Vector3(),e2=new THREE.Vector3();
+  for(let t=0;t<triCount;t++){
+    va.fromBufferAttribute(pos,t*3); vb.fromBufferAttribute(pos,t*3+1); vc.fromBufferAttribute(pos,t*3+2);
+    e1.subVectors(vb,va); e2.subVectors(vc,va);
+    triN[t]=new THREE.Vector3().crossVectors(e1,e2).normalize();
+  }
+  const vk=i=>Math.round(pos.getX(i)*1000)+'_'+Math.round(pos.getY(i)*1000)+'_'+Math.round(pos.getZ(i)*1000);
+  const edge=new Map();
+  for(let t=0;t<triCount;t++){
+    const a=vk(t*3),b=vk(t*3+1),c=vk(t*3+2);
+    [[a,b],[b,c],[c,a]].forEach(e=>{ const k=e[0]<e[1]?e[0]+'|'+e[1]:e[1]+'|'+e[0]; let arr=edge.get(k); if(!arr){arr=[];edge.set(k,arr);} arr.push(t); });
+  }
+  const adj=Array.from({length:triCount},()=>[]);
+  for(const ts of edge.values()) if(ts.length===2){ adj[ts[0]].push(ts[1]); adj[ts[1]].push(ts[0]); }
+  islandOfTri=new Int32Array(triCount).fill(-1);
+  importedIslands=[]; const COS=Math.cos(25*Math.PI/180);
+  for(let t=0;t<triCount;t++){
+    if(islandOfTri[t]>=0) continue;
+    const id=importedIslands.length, stack=[t], mem=[]; islandOfTri[t]=id;
+    while(stack.length){ const x=stack.pop(); mem.push(x);
+      for(const y of adj[x]) if(islandOfTri[y]<0 && triN[x].dot(triN[y])>COS){ islandOfTri[y]=id; stack.push(y); } }
+    const n=new THREE.Vector3(), ctr=new THREE.Vector3();
+    for(const m of mem){ n.add(triN[m]); for(let k=0;k<3;k++) ctr.add(va.fromBufferAttribute(pos,m*3+k)); }
+    n.normalize(); ctr.multiplyScalar(1/(mem.length*3));
+    importedIslands.push({id, tris:mem, normal:n.clone(), centroid:ctr.clone(), size:mem.length});
+  }
+}
+function highlightIslands(){
+  if(!importedMesh||!islandOfTri) return;
+  const geo=importedMesh.geometry, pos=geo.attributes.position, nv=pos.count;
+  let col=geo.getAttribute('color');
+  if(!col){ col=new THREE.BufferAttribute(new Float32Array(nv*3),3); geo.setAttribute('color',col);
+            importedMesh.material.vertexColors=true; importedMesh.material.color.set(0xffffff); importedMesh.material.needsUpdate=true; }
+  for(let t=0;t<nv/3;t++){
+    const sel=selectedIslands.has(islandOfTri[t]);
+    const r=sel?0.13:0.085, gg=sel?0.50:0.085, bb=sel?0.28:0.095;
+    col.setXYZ(t*3,r,gg,bb); col.setXYZ(t*3+1,r,gg,bb); col.setXYZ(t*3+2,r,gg,bb);
+  }
+  col.needsUpdate=true;
+}
+function setupPicking(){
+  if(pickingSetup) return; pickingSetup=true;
+  const el=renderer.domElement;
+  el.addEventListener('pointerdown', e=>{ if(e.button===0) _downXY=[e.clientX,e.clientY]; });
+  el.addEventListener('pointerup', e=>{
+    if(e.button!==0||!_downXY||!importedMesh){ _downXY=null; return; }
+    const moved=Math.hypot(e.clientX-_downXY[0], e.clientY-_downXY[1]); _downXY=null;
+    if(moved>6) return;                                       // an orbit-drag, not a click
+    const r=el.getBoundingClientRect();
+    _ndc.x=((e.clientX-r.left)/r.width)*2-1; _ndc.y=-((e.clientY-r.top)/r.height)*2+1;
+    _ray.setFromCamera(_ndc, camera);
+    const hit=_ray.intersectObject(importedMesh,false);
+    if(!hit.length||islandOfTri==null) return;
+    const isl=islandOfTri[hit[0].faceIndex];
+    if(isl<0) return;
+    if(selectedIslands.has(isl)) selectedIslands.delete(isl); else selectedIslands.add(isl);
+    highlightIslands(); build();
+  });
+}
+
 let importedGeoRaw=null;                  // parsed geometry, centred at origin, before rotation/fit
 const importRot={x:0,y:0,z:0};            // accumulated 90° turns
 function reprocessImport(name){
@@ -446,9 +554,13 @@ function reprocessImport(name){
   importedMesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color:0x17181b, roughness:1, side:THREE.DoubleSide }));
   importedMesh.castShadow=true; importedMesh.receiveShadow=true;
   scene.add(importedMesh);
+  computeIslands(geo);
+  selectedIslands.clear();
+  for(const isl of importedIslands) if(Math.abs(isl.normal.y)<0.5 && isl.size>=2) selectedIslands.add(isl.id);  // auto-pick wall faces
+  setupPicking(); highlightIslands();
   params.width=size.x; params.depth=size.z; params.height=size.y;
   build();
-  if(name) document.getElementById('info').innerHTML = '<b>Imported:</b> '+name+'<br>Use <b>Rotate X/Y/Z</b> to stand it up, then tune the bricks.';
+  if(name) document.getElementById('info').innerHTML = '<b>Imported:</b> '+name+'<br>Rotate to stand it up · <b>CLICK a face</b> to toggle its bricks (green = on).';
 }
 function loadSTL(buffer, name){
   const geo = stlLoader.parse(buffer);
@@ -465,6 +577,8 @@ fIm.add({ ex: loadExample }, 'ex').name('🏠  Load example building');
 fIm.add({ rx: ()=>{ importRot.x=(importRot.x+1)%4; reprocessImport(); } }, 'rx').name('⟳  Rotate X 90°');
 fIm.add({ ry: ()=>{ importRot.y=(importRot.y+1)%4; reprocessImport(); } }, 'ry').name('⟳  Rotate Y 90°');
 fIm.add({ rz: ()=>{ importRot.z=(importRot.z+1)%4; reprocessImport(); } }, 'rz').name('⟳  Rotate Z 90°');
+fIm.add({ selWalls:()=>{ if(!importedMesh)return; selectedIslands.clear(); for(const i of importedIslands) if(Math.abs(i.normal.y)<0.5) selectedIslands.add(i.id); highlightIslands(); build(); } }, 'selWalls').name('▦  Select all walls');
+fIm.add({ clr:()=>{ selectedIslands.clear(); highlightIslands(); if(importedMesh) build(); } }, 'clr').name('▢  Clear faces');
 fIm.add({ sample: ()=>{ if(importedMesh){ scene.remove(importedMesh); importedMesh.geometry.dispose(); importedMesh=null; build(); } } }, 'sample').name('↩  Use sample building');
 
 // ---------- Loop ----------
