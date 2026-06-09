@@ -26,7 +26,9 @@
 {
   "imports": {
     "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
-    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+    "three-mesh-bvh": "https://unpkg.com/three-mesh-bvh@0.7.6/build/index.module.js",
+    "three-bvh-csg": "https://unpkg.com/three-bvh-csg@0.0.16/build/index.module.js"
   }
 }
 </script>
@@ -39,6 +41,43 @@ import * as BufferGeometryUtils from 'three/addons/utils/BufferGeometryUtils.js'
 import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
 
 const INSET = 0.05; // how far the brick skin sits in from the nominal wall face (gives recessed windows)
+
+// ---- optional CSG (boolean) cutting for clean curved openings; loads lazily, falls back to instanced bricks ----
+let Brush=null, Evaluator=null, SUBTRACTION=null, csgReady=false;
+async function loadCSG(){
+  try{
+    const m = await import('three-bvh-csg');
+    Brush=m.Brush; Evaluator=m.Evaluator; SUBTRACTION=m.SUBTRACTION; csgReady=true;
+    build();   // re-run once boolean is available, replacing the instanced preview with the trimmed mesh
+  }catch(e){ console.warn('CSG unavailable, showing untrimmed bricks:', e); }
+}
+function addColorAttr(geo, col){
+  const n=geo.attributes.position.count, ca=new Float32Array(n*3);
+  for(let k=0;k<n;k++){ ca[3*k]=col.r; ca[3*k+1]=col.g; ca[3*k+2]=col.b; }
+  geo.setAttribute('color', new THREE.BufferAttribute(ca,3));
+}
+// a solid cutter that matches an opening, extruded through the wall, for boolean subtraction
+function cutterFor(op, wall, depth){
+  const shape=new THREE.Shape();
+  if(op.type==='circle'){
+    shape.moveTo(op.uc+op.rc, op.vc);
+    shape.absarc(op.uc, op.vc, op.rc, 0, Math.PI*2, false);
+  } else {
+    const hw=op.ww/2, top=op.v0+op.wh;
+    shape.moveTo(op.uc-hw, op.v0);
+    shape.lineTo(op.uc-hw, top);
+    shape.absarc(op.uc, top, hw, Math.PI, 0, true);   // semicircle over the top
+    shape.lineTo(op.uc+hw, op.v0);
+    shape.lineTo(op.uc-hw, op.v0);
+  }
+  let geo=new THREE.ExtrudeGeometry(shape, {depth, bevelEnabled:false, curveSegments:64});
+  if(geo.attributes.uv) geo.deleteAttribute('uv');
+  geo=BufferGeometryUtils.mergeVertices(geo);
+  geo.translate(0,0,-depth/2);
+  geo.applyMatrix4(new THREE.Matrix4().makeBasis(wall.uDir, wall.vDir, wall.normal).setPosition(wall.origin));
+  geo.computeVertexNormals();
+  return geo;
+}
 
 // ---------- Renderer / scene ----------
 const app = document.getElementById('app');
@@ -167,14 +206,15 @@ function borderFor(op, L, Hb, g){
 // ---------- Build ----------
 const unitBox = new THREE.BoxGeometry(1,1,1);
 const brickMat = new THREE.MeshStandardMaterial({ color:0xffffff, roughness:0.93, metalness:0.0 });
+const csgMat = new THREE.MeshStandardMaterial({ color:0xb05a34, roughness:0.93, metalness:0.0 });
 const coreMat  = new THREE.MeshStandardMaterial({ color:0x17181b, roughness:1 });
 const roofMat  = new THREE.MeshStandardMaterial({ color:0x3a2c24, roughness:1 });
 
 let brickMesh=null, coreMesh=null, roofMesh=null;
-let lastMatrices=[];
+let lastMatrices=[], lastBrickGeo=null;
 
 function build(){
-  if(brickMesh){ scene.remove(brickMesh); brickMesh.geometry.dispose(); brickMesh.dispose(); }
+  if(brickMesh){ scene.remove(brickMesh); brickMesh.geometry.dispose(); if(brickMesh.dispose) brickMesh.dispose(); }
   if(coreMesh){ scene.remove(coreMesh); coreMesh.geometry.dispose(); }
   if(roofMesh){ scene.remove(roofMesh); roofMesh.geometry.dispose(); }
 
@@ -257,13 +297,29 @@ function build(){
   }
 
   const count = mats.length;
-  brickMesh = new THREE.InstancedMesh(unitBox, brickMat, count);
-  brickMesh.castShadow = true; brickMesh.receiveShadow = true;
-  for(let i=0;i<count;i++){ brickMesh.setMatrixAt(i,mats[i]); brickMesh.setColorAt(i,cols[i]); }
-  brickMesh.instanceMatrix.needsUpdate = true;
-  if(brickMesh.instanceColor) brickMesh.instanceColor.needsUpdate = true;
-  scene.add(brickMesh);
   lastMatrices = mats;
+  if(csgReady){
+    // merge all bricks (with per-brick vertex colour), then boolean-subtract each opening -> clean curved edges
+    const geoms=[];
+    for(let i=0;i<count;i++){ const gg=unitBox.clone(); gg.deleteAttribute('uv'); gg.applyMatrix4(mats[i]); geoms.push(gg); }
+    const merged=BufferGeometryUtils.mergeGeometries(geoms,false);
+    const ev=new Evaluator(); ev.attributes=['position','normal'];
+    let res=new Brush(merged); res.updateMatrixWorld();
+    for(const wall of walls) for(const op of wall.openings){
+      const cb=new Brush(cutterFor(op, wall, params.brickDepth+0.4)); cb.updateMatrixWorld();
+      res=ev.evaluate(res, cb, SUBTRACTION);
+    }
+    csgMat.color.set(params.color);
+    res.material=csgMat; res.castShadow=true; res.receiveShadow=true;
+    brickMesh=res; lastBrickGeo=res.geometry; scene.add(brickMesh);
+  } else {
+    brickMesh = new THREE.InstancedMesh(unitBox, brickMat, count);
+    brickMesh.castShadow = true; brickMesh.receiveShadow = true;
+    for(let i=0;i<count;i++){ brickMesh.setMatrixAt(i,mats[i]); brickMesh.setColorAt(i,cols[i]); }
+    brickMesh.instanceMatrix.needsUpdate = true;
+    if(brickMesh.instanceColor) brickMesh.instanceColor.needsUpdate = true;
+    lastBrickGeo=null; scene.add(brickMesh);
+  }
 
   coreMesh = new THREE.Mesh(new THREE.BoxGeometry(params.width-2*INSET, params.height, params.depth-2*INSET), coreMat);
   coreMesh.position.set(0, params.height/2, 0);
@@ -285,9 +341,13 @@ function build(){
 // ---------- Bake to STL ----------
 function exportSTL(){
   const geoms=[];
-  for(const mat of lastMatrices){ const gg=unitBox.clone(); gg.applyMatrix4(mat); geoms.push(gg); }
+  if(lastBrickGeo){                                   // boolean-trimmed mesh -> the clean printable geometry
+    const b=lastBrickGeo.clone(); if(b.attributes.color) b.deleteAttribute('color'); if(b.attributes.uv) b.deleteAttribute('uv'); geoms.push(b);
+  } else {
+    for(const mat of lastMatrices){ const gg=unitBox.clone(); if(gg.attributes.uv) gg.deleteAttribute('uv'); gg.applyMatrix4(mat); geoms.push(gg); }
+  }
   const cg=new THREE.BoxGeometry(params.width-2*INSET, params.height, params.depth-2*INSET);
-  cg.translate(0, params.height/2, 0);
+  cg.translate(0, params.height/2, 0); if(cg.attributes.uv) cg.deleteAttribute('uv');
   geoms.push(cg);
   const merged=BufferGeometryUtils.mergeGeometries(geoms,false);
   const mesh=new THREE.Mesh(merged);
@@ -301,21 +361,24 @@ function exportSTL(){
   merged.dispose();
 }
 
+// debounce rebuilds so dragging a slider doesn't run the boolean on every tick
+let _bt; function rebuild(){ clearTimeout(_bt); _bt=setTimeout(build, 180); }
+
 // ---------- GUI ----------
 const gui = new GUI({ title:'Brick Controls' });
 const fB = gui.addFolder('Building');
-fB.add(params,'width',2,8,0.1).onChange(build);
-fB.add(params,'depth',2,8,0.1).onChange(build);
-fB.add(params,'height',2,6,0.1).onChange(build);
+fB.add(params,'width',2,8,0.1).onChange(rebuild);
+fB.add(params,'depth',2,8,0.1).onChange(rebuild);
+fB.add(params,'height',2,6,0.1).onChange(rebuild);
 const fK = gui.addFolder('Brick');
-fK.add(params,'brickLength',0.08,0.40,0.005).name('Brick size (length)').onChange(build);
-fK.add(params,'brickHeight',0.03,0.15,0.002).name('Brick height').onChange(build);
-fK.add(params,'brickDepth',0.01,0.12,0.002).name('Brick depth (relief)').onChange(build);
-fK.add(params,'mortarGap',0,0.04,0.001).name('Mortar gap').onChange(build);
-fK.add(params,'bondType',['Running','Stack','Wild']).name('Brick type / bond').onChange(build);
-fK.add(params,'randomness',0,1,0.01).name('Randomness').onChange(build);
-fK.add(params,'rotation',0,1,0.01).name('Rotation jitter').onChange(build);
-fK.addColor(params,'color').name('Brick colour').onChange(build);
+fK.add(params,'brickLength',0.08,0.40,0.005).name('Brick size (length)').onChange(rebuild);
+fK.add(params,'brickHeight',0.03,0.15,0.002).name('Brick height').onChange(rebuild);
+fK.add(params,'brickDepth',0.01,0.12,0.002).name('Brick depth (relief)').onChange(rebuild);
+fK.add(params,'mortarGap',0,0.04,0.001).name('Mortar gap').onChange(rebuild);
+fK.add(params,'bondType',['Running','Stack','Wild']).name('Brick type / bond').onChange(rebuild);
+fK.add(params,'randomness',0,1,0.01).name('Randomness').onChange(rebuild);
+fK.add(params,'rotation',0,1,0.01).name('Rotation jitter').onChange(rebuild);
+fK.addColor(params,'color').name('Brick colour').onChange(rebuild);
 const fV = gui.addFolder('View / Export');
 fV.add(params,'showCore').name('Show core wall').onChange(v=>{ if(coreMesh) coreMesh.visible=v; });
 fV.add(params,'exportSTL').name('⬇  Export STL (bake)');
@@ -326,6 +389,7 @@ addEventListener('resize',()=>{
   renderer.setSize(innerWidth,innerHeight);
 });
 build();
+loadCSG();
 (function animate(){ requestAnimationFrame(animate); controls.update(); renderer.render(scene,camera); })();
 </script>
 </body>
